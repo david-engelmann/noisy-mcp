@@ -31,24 +31,34 @@ mcp = FastMCP("noisy-mcp")
 
 
 def _emit_bytes(total_mib: int, rate_mib_per_sec: float) -> None:
-    """Write `total_mib` MiB of synthetic 1 KiB stderr lines, rate-limited."""
+    """Write `total_mib` MiB of synthetic 1 KiB stderr lines, rate-limited.
+
+    Deadline-based pacing: at any point we check how many bytes *should*
+    have been written by now (elapsed * rate) and only emit if we're
+    behind. Avoids the bursty "write 1.5 MiB, flush blocks while
+    pipe drains, write next chunk immediately" pattern from earlier
+    iterations.
+    """
     target = total_mib * 1024 * 1024
     line = ("x" * 1023) + "\n"  # 1024 bytes per line
+    bytes_per_sec = max(1.0, rate_mib_per_sec * 1024 * 1024)
+    chunk = line * 32  # 32 KiB chunk so we don't call write() 35,000 times
+    chunk_len = len(chunk)
+    start = time.monotonic()
     written = 0
-    chunk_size = max(1, int(rate_mib_per_sec * 1024 * 1024))  # bytes per second
-    chunk_lines = max(1, chunk_size // len(line))
     while written < target:
-        next_pause = time.monotonic() + 1.0
-        for _ in range(chunk_lines):
-            if written >= target:
-                break
-            sys.stderr.write(line)
-            written += len(line)
-        sys.stderr.flush()
-        if written < target:
-            remaining = next_pause - time.monotonic()
-            if remaining > 0:
-                time.sleep(remaining)
+        elapsed = time.monotonic() - start
+        expected = int(elapsed * bytes_per_sec)
+        if written < expected:
+            sys.stderr.write(chunk)
+            written += chunk_len
+            if written % (256 * 1024) == 0:
+                sys.stderr.flush()
+        else:
+            # ahead of schedule; sleep just enough for the next chunk to be due
+            need = chunk_len / bytes_per_sec
+            time.sleep(max(0.005, min(need, 0.1)))
+    sys.stderr.flush()
 
 
 @mcp.tool()
