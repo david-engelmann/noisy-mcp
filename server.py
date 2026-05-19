@@ -33,31 +33,26 @@ mcp = FastMCP("noisy-mcp")
 def _emit_bytes(total_mib: int, rate_mib_per_sec: float) -> None:
     """Write `total_mib` MiB of synthetic 1 KiB stderr lines, rate-limited.
 
-    Deadline-based pacing: at any point we check how many bytes *should*
-    have been written by now (elapsed * rate) and only emit if we're
-    behind. Avoids the bursty "write 1.5 MiB, flush blocks while
-    pipe drains, write next chunk immediately" pattern from earlier
-    iterations.
+    Per-line pacing: write one 1 KiB line, flush, sleep. This matters
+    because Warp's MCP stderr forwarder reads with `read_line` — if many
+    lines arrive in the pipe before a single `read_line` call returns,
+    they all coalesce into one `logger.log(...)` invocation, which then
+    appears as one large entry in the simple_logger rotation loop and
+    inflates per-file sizes far past the configured 10 MiB threshold.
+    By flushing and sleeping per line we keep the pipe one-line-deep so
+    the receiver's read_line returns one line at a time.
     """
     target = total_mib * 1024 * 1024
     line = ("x" * 1023) + "\n"  # 1024 bytes per line
+    line_len = len(line)
     bytes_per_sec = max(1.0, rate_mib_per_sec * 1024 * 1024)
-    chunk = line * 32  # 32 KiB chunk so we don't call write() 35,000 times
-    chunk_len = len(chunk)
-    start = time.monotonic()
+    sleep_per_line = line_len / bytes_per_sec
     written = 0
     while written < target:
-        elapsed = time.monotonic() - start
-        expected = int(elapsed * bytes_per_sec)
-        if written < expected:
-            sys.stderr.write(chunk)
-            written += chunk_len
-            if written % (256 * 1024) == 0:
-                sys.stderr.flush()
-        else:
-            # ahead of schedule; sleep just enough for the next chunk to be due
-            need = chunk_len / bytes_per_sec
-            time.sleep(max(0.005, min(need, 0.1)))
+        sys.stderr.write(line)
+        sys.stderr.flush()
+        written += line_len
+        time.sleep(sleep_per_line)
     sys.stderr.flush()
 
 
